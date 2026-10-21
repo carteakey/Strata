@@ -5096,6 +5096,11 @@ class Service:
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
+                                    if parser.state == "reasoning":
+                                        wrap = True     # break out of the thinking loop into the answer
+                                        print(f"[strata] repeated token inside thinking ({self.tok.decode([run_tok])!r} "
+                                              f"x{run_len}): breaking out of thinking and forcing an answer", flush=True)
+                                        break
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
                                 piece = detok.push(t)
