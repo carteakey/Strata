@@ -220,6 +220,16 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(engine.calls[1][1], 40000 - len(retained))
         self.assertNotIn('</think>', self.tok.decode(engine.calls[1][0]))
 
+    def test_repeat_stop_tokens_inside_thinking_wraps_and_answers(self):
+        """A single repeated token inside <think> (#606) must not end as empty length, but wrap and answer."""
+        engine = RecordingEngine(self.tok, ['x' * 60, 'Done answer.<|im_end|>'])
+        service = Service(engine, self.tok, None)
+        service.repeat_stop_tokens = 48
+        events = list(service.run(self.ids, True, [], 4000, {}, threading.Event()))
+        content = ''.join(e.text or '' for kind, e in events if kind == 'event' and e.kind == 'content')
+        self.assertEqual(content, 'Done answer.')
+        self.assertEqual(events[-1][1]['finish'], 'stop')
+
 
 if __name__ == '__main__':
     unittest.main()
