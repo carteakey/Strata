@@ -2949,10 +2949,25 @@ constexpr IlRows kIlRows_75[] = {
     {14, {{0, 0, 1, 2, 1}, {0, 2, 2, 4, 4}, {0, 4, 4, 4, 4}}},   // Q6_K
     {11, {{1, 2, 4, 4, 4}, {1, 2, 4, 4, 4}, {1, 2, 2, 2, 2}}},   // Q3_K
 };
+// Ada (sm_89), read off mmvq_il_parity --bench --emit-table on an RTX 4070 (46 SMs, sm_89), the same 3% rule
+// (a cell is non-zero only if the fastest rows count takes at least 3% off native_mmvq's time in every measured shape
+// of that class).  Bitwise equal to native_mmvq, so the table is only speed.  It differs from the shared table in
+// every type, and the shared table has no Q3_K row at all (so Q3_K shapes ran the plain kernel).
+constexpr IlRows kIlRows_89[] = {
+    {23, {{0, 0, 0, 1, 0}, {1, 1, 1, 1, 1}, {2, 2, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 0, 1, 1, 1}, {0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
+    {13, {{0, 0, 1, 1, 1}, {0, 0, 1, 1, 1}, {1, 2, 1, 2, 2}}},   // Q5_K
+    {14, {{0, 0, 0, 0, 0}, {0, 0, 1, 2, 2}, {0, 1, 4, 1, 1}}},   // Q6_K
+    {11, {{1, 1, 1, 2, 1}, {1, 1, 1, 1, 1}, {2, 1, 1, 1, 1}}},   // Q3_K
+};
 // One column: rows a warp by n_out class, 0 = native_mmvq's single-column kernels (STRATA_MMVQ_IL_T1=0 turns this off).
 struct Il1Rows { int type; uint8_t r[5]; };
 constexpr Il1Rows kIl1Rows_86[] = {
     {11, {0, 1, 1, 1, 1}},   // Q3_K: 2560x10240 60 -> 43 us, 6144x2560 30 -> 26 us on the A4000
+};
+// Ada (sm_89), the same card and the same tool run: only Q3_K takes the interleaved kernel at one column.
+constexpr Il1Rows kIl1Rows_89[] = {
+    {11, {0, 0, 1, 1, 1}},   // Q3_K
 };
 // Tesla P40 (sm_61), the same three runs: IQ4_XS 2560x10240 102 -> 58 us, the Q5_K head 1754 -> 1507 us
 constexpr Il1Rows kIl1Rows_61[] = {
@@ -2964,6 +2979,7 @@ struct Il1Arch { int cc; const Il1Rows* t; size_t n; };
 constexpr Il1Arch kIl1Arch[] = {
     {61, kIl1Rows_61, sizeof(kIl1Rows_61) / sizeof(Il1Rows)},
     {86, kIl1Rows_86, sizeof(kIl1Rows_86) / sizeof(Il1Rows)},
+    {89, kIl1Rows_89, sizeof(kIl1Rows_89) / sizeof(Il1Rows)},   // Ada: measured on an RTX 4070 (46 SMs)
 };
 bool il_env_on(const char* name) {
     const char* v = std::getenv(name);
@@ -2978,6 +2994,7 @@ constexpr IlArch kIlArch[] = {
     {75, kIlRows_75, sizeof(kIlRows_75) / sizeof(IlRows)},   // Turing: measured on an RTX 2080 Ti
     {70, kIlRows_70, sizeof(kIlRows_70) / sizeof(IlRows)},   // Volta: PR 1401, measured on a V100-SXM2
     {86, kIlRows_86, sizeof(kIlRows_86) / sizeof(IlRows)},   // 143-dense: RTX A4000 with the real shapes (Q3_K added)
+    {89, kIlRows_89, sizeof(kIlRows_89) / sizeof(IlRows)},   // Ada: measured on an RTX 4070 (46 SMs)
 };
 // STRATA_MMVQ_IL_ROWS="type:ncols:r0,r1,r2,r3,r4;..." overrides single rows of the table for every card (type = ggml
 // type 23/12/13/14, ncols 2-4, r* = rows a warp 0/1/2/4 for the five n_out classes).  Parsed once.
