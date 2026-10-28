@@ -1,4 +1,65 @@
-<h1 align="center">Strata</h1>
+# Strata `4070-main-lite` (`carteakey/Strata`)
+
+This branch (`4070-main-lite`) is a streamlined, minimal-bloat fork of Strata tailored specifically for an **RTX 4070 12 GB (Ada Lovelace, `sm_89`, 46 SMs)** paired with 64 GB DDR5-5200 host RAM running **Qwen3.8-Flash-Next** (`qwen4exp`, ISTA-DASLab GSQ-RCO IQ3_XXS with unquantized Q8_0 PLE table).
+
+Rather than tracking every upstream release or pulling in multi-vendor bloat, this fork cherry-picks only high-value inference kernels, speculative decoding improvements, and CUDA optimizations while pruning unused architectures.
+
+---
+
+## Performance Progression on RTX 4070 (12 GB)
+
+Measured with `bench-models/bench-qwen38-refresh-ab.sh` on Linux 7.3.0 CachyOS, powersave governor, DDR5-5200 4x16 GB, serving `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` (`IQ3_XXS`, unquantized Q8_0 PLE table on NVMe):
+
+| Engine / Revision | Sustained Decode (t/s) | Peak Decode (t/s) | 8k Prefill (t/s) | 4k Needle Pass | VRAM Footprint |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Strata v0.1.45 (upstream tag)** | 63.83 | 67.7 | 1,926.1 | Yes (`true`) | 11,696 MiB |
+| **Strata v0.2.6 (upstream tag)** | 65.53 | 70.5 | 1,890.7 | Yes (`true`) | 11,696 MiB |
+| **`4070-main-lite` (initial pruned + HC fusions)** | 65.08 | 72.9 | 1,894.1 | Yes (`true`) | 11,698 MiB |
+| **`4070-main-lite` + Ada `sm_89` MMVQ (PR #3453)** | **69.60** | **76.1** | **1,883.1** | Yes (`true`) | **11,696 MiB** |
+
+Net gain: **+5.77 t/s (+9.0%) over upstream v0.1.45**, with peak decode reaching **76.1 t/s**.
+
+---
+
+## Fork Modifications & Architecture Changes
+
+### 1. Pruned Bloat & Build Streamlining
+- **Removed Unused Backends (331 files / 172,853 LOC removed)**:
+  - Deleted `src/kernels/metal/` (macOS Apple Silicon).
+  - Deleted `src/kernels/sycl/` (Intel Arc).
+  - Deleted AMD ROCm tuning scripts (`src/kernels/rocm/hipblaslt_tuning.hpp`, `src/kernels/rocm/rocblas_tuning.hpp`).
+- **Gated Experimental Engines & Tests**:
+  - Gated unreleased Qwen3.5 engine (`src/qwen35/`) behind `STRATA_ENABLE_QWEN35=OFF`.
+  - Disabled 109 test binaries from standard build (`STRATA_BUILD_TESTS=OFF`).
+  - Set default `CMAKE_CUDA_ARCHITECTURES=89` targeting Ada Lovelace.
+- **Binary Footprint**:
+  - `build/strata` executable reduced to **73.0 MB** (down from 77.5 MB on v0.1.45 and 78.7 MB on v0.2.6).
+
+### 2. Tracked Inference Commits & Cherry-Picks
+- **`8645328d` - Fused Hyper-Connections (`gr.cu`, `fused_gr.cu`)**:
+  - Folded the hyper-connection inject and gate/mean operations into adjacent GEMV down grids (`fused_gm = hc <= 4`), eliminating two standalone kernel dispatches per verification step (6 launches reduced to 4).
+- **`7ce60ad3` - `STRATA_GR_NORM_FAST=1` Register-Split Norm**:
+  - Ported register-split norm kernel on CUDA producing bitwise-identical output while trimming register pressure.
+- **`9aafcbf0` - Reasoning Loop Recovery (`serve/server.py`)**:
+  - Added loop detection recovery: when `repeat_stop_tokens` fires inside `<think>`, the server wraps thinking into the final answer rather than failing the generation. Verified with 19/19 unit tests passing.
+- **`0cef00fa` - Ada Lovelace `sm_89` MMVQ Interleave Table (Strata PR #3453)**:
+  - Added hardware-calibrated warp row counts (`kIlRows_89[]`, `kIl1Rows_89[]`) for `IQ4_XS`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q3_K` in `src/kernels/cuda/native_mmvq.cu`.
+  - Yielded a direct +4.52 t/s (+7.0%) sustained decode improvement (65.08 -> 69.60 t/s).
+
+### 3. Evaluated & Rejected Experiments
+- **`--mtp-q4 head` (On-the-fly Q4_0 draft head quantization)**:
+  - Tested quantizing the MTP draft head from Q8_0 down to Q4_0 to reduce DRAM read traffic during drafting.
+  - Result: Decode dropped from 69.60 t/s to 67.88 t/s. On-the-fly ALU dequantization in the draft step cost more latency than the memory bandwidth saved on an RTX 4070. Reverted to keep native Q8_0 draft head.
+
+### 4. Candidate Backlog (Inference Ports from llama.cpp & Upstream)
+- **MTP Draft Vocab Trimming (llama.cpp PR #31037 / FR-Spec)**:
+  - Trimming the MTP draft projection from 152k tokens down to the active top-K vocabulary to accelerate speculative token proposal.
+- **Quantized Q8_0 KV in FlashAttention (llama.cpp PR #30792 / #30790)**:
+  - Direct int8 tensor math in the FlashAttention tile kernel, eliminating intermediate FP16 scratch buffer expansion during long-context KV decode.
+
+---
+
+<h1 align="center">Strata (Upstream Base)</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
