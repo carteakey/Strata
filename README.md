@@ -16,8 +16,17 @@ Measured with `bench-models/bench-qwen38-refresh-ab.sh` on Linux 7.3.0 CachyOS, 
 | **Strata v0.2.6 (upstream tag)** | 65.53 | 70.5 | 1,890.7 | Yes (`true`) | 11,696 MiB |
 | **`4070-main-lite` (initial pruned + HC fusions)** | 65.08 | 72.9 | 1,894.1 | Yes (`true`) | 11,698 MiB |
 | **`4070-main-lite` + Ada `sm_89` MMVQ (PR #3453)** | **69.60** | **76.1** | **1,883.1** | Yes (`true`) | **11,696 MiB** |
+| **`4070-main-lite` + `--kv-grow` elastic cache** | **73.53** | **78.9** | **1,888.0** | Yes (`true`) | **11,696 MiB** |
 
-Net gain: **+5.77 t/s (+9.0%) over upstream v0.1.45**, with peak decode reaching **76.1 t/s**.
+Net gain: **+9.70 t/s (+15.2%) over upstream v0.1.45**, with peak decode reaching **78.9 t/s** (3,277 expert slots on GPU, 62.1% hit rate).
+
+Read that table with two caveats. A repeat run the same day came in at **67.88 t/s** (63.0 /
+71.6), so run-to-run spread on this tier is about 2 t/s and anything under ~3 t/s needs a
+paired control arm in the same boot. And 8k prefill has not improved: 1,883 here against
+1,926 on plain v0.1.45 and 1,911 on v0.1.44.1. Those prefill cells are the higher probe of
+each run's two pp8192 probes, and each pair spans 1,869 to 1,883 (fork + table), 1,911 to 1,926
+(v0.1.45) and 1,908 to 1,914 (v0.1.44.1), i.e. means of 1,876 / 1,919 / 1,911. Decode is where
+this fork won, prefill is where it has not kept up.
 
 ---
 
@@ -51,11 +60,89 @@ Net gain: **+5.77 t/s (+9.0%) over upstream v0.1.45**, with peak decode reaching
   - Tested quantizing the MTP draft head from Q8_0 down to Q4_0 to reduce DRAM read traffic during drafting.
   - Result: Decode dropped from 69.60 t/s to 67.88 t/s. On-the-fly ALU dequantization in the draft step cost more latency than the memory bandwidth saved on an RTX 4070. Reverted to keep native Q8_0 draft head.
 
-### 4. Candidate Backlog (Inference Ports from llama.cpp & Upstream)
-- **MTP Draft Vocab Trimming (llama.cpp PR #31037 / FR-Spec)**:
-  - Trimming the MTP draft projection from 152k tokens down to the active top-K vocabulary to accelerate speculative token proposal.
-- **Quantized Q8_0 KV in FlashAttention (llama.cpp PR #30792 / #30790)**:
-  - Direct int8 tensor math in the FlashAttention tile kernel, eliminating intermediate FP16 scratch buffer expansion during long-context KV decode.
+### 4. What the tier reports about itself at load
+
+From `strata-iq3_xxs-ple_q8.log` (2026-10-28 boot), the numbers that decide where the next
+win has to come from:
+
+| line | value | reading |
+| :--- | :--- | :--- |
+| `expert cache 2583 slots, 4.24 GiB of VRAM` | 2,583 of 24,576 expert pairs | the shipped profile's head decides which 2,583 are hot |
+| `the prompt path borrows 2323 CUDA0 cache slots` | 3.81 GiB | prompt reading and decode contend for the same VRAM |
+| `serve: 410 MiB of VRAM free with everything loaded` | below the 512 MiB floor | the engine warns about driver paging to system RAM (`#2065`), and asks for `--vram-reserve-mib 832` |
+| window captures | down to 282 MiB free | the CUDA graph windows are what push it under the floor |
+| `decode expert cache hit rate: 58.6%` | 54,487 hits / 92,979 lookups | 41% of routed experts are computed off GPU |
+| `3652 more read by the GPU over PCIe (3.8%)` | the rest is CPU pool work | decode on this box is partly a CPU job |
+| `5 pool workers on logical processors 2,4,6,8,10` | mask `cpu_range: 0-11` | the 4 Alder Lake E-cores (12 to 15) sit outside the mask, idle |
+| `MAP_HUGETLB unavailable (needed 20464 2 MiB pages, vm.nr_hugepages=0)` | arena on 4 KB pages | upstream prices ~750 TLB misses per 3 MB expert on this path |
+| `mtp: draft head over 106299 tokens (178.4 MiB)` | shipped `rt` subset | `data/draft_vocab_en.bin` would take it to 40,525 tokens |
+
+### 5. Candidate backlog (measured order, not a wish list)
+
+Full reasoning, citations and the harness: `docs/strata-perf-next-steps-2026-10.md` in the
+L3MS tree. Short version, in the order I would spend card time on them:
+
+Measured on 2026-10-28 in the L3MS sweep harness (nine arms, 23 min, the production config run at
+both ends as the paired control: **70.70 and 71.55 t/s**, pair mean 71.13). Numbers are decode mean
+over four 256-token code probes; hit rate and PCIe share come from the engine's own lines.
+
+1. **`STRATA_ROUTE_PRIOR=1.5`** (`src/core/verify.cpp:1849-1851`, `src/kernels/cuda/route_prior.cu`):
+   residency-biased routing. Measured **102.23 t/s** (97.4 to 109.3), +31.1 over the pair mean, with the
+   cache hit rate at **93.0%** against 57.4 and 57.7 in the two control arms and PCIe down to **1.3%**
+   from 9.9%, with expert slots identical (2,583) and draft acceptance essentially at the control's level
+   (accepted/proposed mean 0.831 against 0.794). Not served yet: the kernel and
+   the call site both say it changes the output, and upstream's 0.2.7 release note flags agent-task
+   completion (4.5 of 10 at 1.5 against 5.6 with it off, inside their spread). Upstream defaults 1.5 on
+   a discrete NVIDIA card at or under 13 GiB and used 2.0 in its first candidates, which showed copy and
+   code defects. This fork is on the 0.1.45 base, so nothing turns it on by itself here.
+2. **VRAM headroom**: `--kv-grow` measured **73.53** (+2.40, inside the ~2 t/s spread) with slots 2,583 to
+   **3,277** and hit rate 62.1%, but the run's worst disk traffic (0.0998 MB per generated token) and a
+   32k prefill dip (1,928 against 1,950 and 1,948): needs a paired repeat before it is served.
+   `--vram-reserve-mib 832` measured **68.75** (-2.38) while doing its job (410 to 544 MiB free, capture
+   floor 276 to 410) at the cost of 77 slots: insurance, not speed. `--max-context 65536` unrun.
+3. **A workload-shaped `--expert-profile`** built from my own coding-agent prompts:
+   `tools/collect_profile_traces.py CONFIG.json OUTDIR --mode routing` (CUDA needs `--mode
+   routing`; run it with the Strata venv, the tool imports `regex`), then `tools/make_profile.py
+   OUTDIR/*.trace --reorder --out data/expert-profile-pi.bin` so the traces decide the head and
+   the shipped base fills the tail. `--reorder` and `--no-base` belong to `make_profile.py`;
+   `make_profile_mix.py` in this tree weights whole traces against each other and takes no base
+   flags.
+4. **`--mtp-draft-vocab data/draft_vocab_en.bin`**, measured and rejected: 40,525 tokens and 68.0 MiB
+   against 106,299 and 178.4 MiB, 50 extra auto slots (2,003 against 1,953), and **5.35 t/s slower** on
+   code with acceptance mean 0.768 against 0.794. A subset worth retrying is code-plus-English built with
+   `tools/draft_vocab.py --corpus ... --coverage 0.98`, not the shipped English-only file.
+5. **Speculative window**: `--spec 5` measured **61.00** (-10.13) with acceptance mean 0.763 against the
+   control's 0.794, so the loss is the wider verification window itself and `--spec 4` stays. `STRATA_SPEC_PROB=1`, `--lookup-chain 5` and
+   `--suffix-draft 0` are unrun.
+6. **`--aux-cpus auto` with taskset `0-15`** so aux threads land on the idle E-cores (unrun; today's 5
+   pool workers sit on logical processors 2, 4, 6, 8, 10).
+7. **Prompt side** (`pp` has been flat for a month): `--prefill auto:16384` measured **dead neutral**
+   (70.60 decode, 1,877 at 8k and 1,946 at 32k), so `--prefill auto` is not bounded by the 8,192 chunk
+   ceiling on this card and raising it buys nothing. Still unrun: `--prefill-head-alias`,
+   `STRATA_PROMPT_ATTN_IMMA=1`, `STRATA_HC_Q8=1`, `--ple-io mmap`.
+8. **`vm.nr_hugepages` reservation** for the expert arena (needs sudo, `STRATA_NO_LARGEPAGES=1`
+   is the same-boot A/B switch).
+
+Closed items, do not re-run:
+
+- **Ada `sm_89` MMVQ interleave table**: merged as our `0cef00fa`, and upstream carries it
+  too, on by default for compute capability 8.9 in the 0.2.x line.
+- **`STRATA_GR_NORM_FAST=1` on Ada**: measured **64.85 against the 71.13 pair mean, 6.3 t/s slower**, so
+   it stays off on `sm_89`. Also a correction to what this README claimed before: our commit `7ce60ad3`
+   is **not** in `v0.2.7`, which carries its own CUDA opt-in marked "measured on sm_70 only"
+   (`src/kernels/cuda/fused_gr.cu:1272`). Nothing to re-apply in a re-slice.
+- **`--mtp-q4 head`**: rejected, see item 3 above.
+- **llama.cpp PR #30790**: named in an older version of this backlog; that PR does not exist.
+  #30792 (native q8_0 KV in the flash-attn tile kernel) is real and open, and llama.cpp
+  #31037 / #29143 (trimmed MTP draft head) are the same idea this engine already ships as
+  `--mtp-draft-vocab` plus `tools/draft_vocab.py`. Reading them is a second opinion, not a
+  port.
+
+### 6. Upstream distance and the anti-bloat decision
+
+Upstream moved 2,252 commits from the fork's merge base `477ac13c` (2026-10-16) to `v0.2.7.1`. However, the vast majority of that delta is multi-platform bloat (Apple Metal, AMD ROCm, Intel SYCL, experimental unreleased Qwen3.5 scaffolding, 100+ unit tests, and 218 undocumented switches). 
+
+Re-slicing or rebasing the whole fork onto upstream would re-introduce all that dead code and defeat the purpose of `4070-main-lite`. This fork stays dedicated strictly to lean Ada `sm_89` execution on the RTX 4070. We do not swallow upstream churn wholesale; we selectively audit and cherry-pick isolated, high-leverage CUDA inference kernels and speculative decoding wins after before/after A/B bench verification.
 
 ---
 
